@@ -25,7 +25,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) int mNumChannels; 
 @property(nonatomic) int mFeedThreshold; 
 @property(nonatomic) bool mDidInvokeFeedCallback; 
-@property(nonatomic) bool mDidSetup; 
+@property(nonatomic) bool mDidSetup;
+@property(nonatomic) int addingDummyDataTimes;
 @end
 
 @implementation FlutterPcmSoundPlugin
@@ -39,10 +40,11 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.mMethodChannel = methodChannel;
     instance.mLogLevel = verbose;
     instance.mSamples = [NSMutableData new];
-    instance.mFeedThreshold = 8000;
+    instance.mFeedThreshold = 16000; //9600*2;
     instance.mDidInvokeFeedCallback = false;
     instance.mDidSetup = false;
     instance.volumeLevel = 1.0f;
+    instance.addingDummyDataTimes = 0;
 
     [registrar addMethodCallDelegate:instance channel:methodChannel];
 }
@@ -207,6 +209,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             result(@(true));
         } else if ([@"feed" isEqualToString:call.method])
         {
+            NSUInteger remainingFrames;
+            BOOL shouldRequestMore = false;
             // setup check
             if (self.mDidSetup == false) {
                 result([FlutterError errorWithCode:@"Setup" message:@"must call setup first" details:nil]);
@@ -218,17 +222,26 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
             @synchronized (self.mSamples) {
                 [self.mSamples appendData:buffer.data];
+
+                remainingFrames = [self.mSamples length] / (self.mNumChannels * sizeof(short));
+                NSLog(@"-> remainingFrames = %lu, mSamples = %lu", remainingFrames, self.mSamples.length);
+                // should request more frames?
+                shouldRequestMore = remainingFrames <= self.mFeedThreshold;// && !self.mDidInvokeFeedCallback;
             }
 
-            // reset
-            self.mDidInvokeFeedCallback = false;
+            if(!shouldRequestMore){
+                self.addingDummyDataTimes = 0;
+                // reset
+                self.mDidInvokeFeedCallback = false;
 
-            // start
-            OSStatus status = AudioOutputUnitStart(_mAudioUnit);
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
+                // start
+                NSLog(@"-> start");
+                OSStatus status = AudioOutputUnitStart(_mAudioUnit);
+                if (status != noErr) {
+                    NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed. OSStatus: %@", @(status)];
+                    result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                    return;
+                }
             }
 
             result(@(true));
@@ -333,15 +346,26 @@ static OSStatus RenderCallback(void *inRefCon,
         [instance.mSamples replaceBytesInRange:range withBytes:NULL length:0];
 
         remainingFrames = [instance.mSamples length] / (instance.mNumChannels * sizeof(short));
-
+        NSLog(@"remainingFrames = %lu, mSamples = %lu // addingDummyDataTimes = %d", remainingFrames, instance.mSamples.length, instance.addingDummyDataTimes);
         // should request more frames?
         shouldRequestMore = remainingFrames <= instance.mFeedThreshold && !instance.mDidInvokeFeedCallback;
+
+        @synchronized (instance.mSamples) {
+            if(remainingFrames < 1000 && instance.addingDummyDataTimes < 100){
+                instance.addingDummyDataTimes++;
+//                NSData *zeros = [NSData dataWithLength:9600 * 2];
+                NSMutableData *mSamples = [NSMutableData dataWithLength:2048];
+                [instance.mSamples appendData:mSamples];
+            }
+        }
     }
 
     // stop running, if needed
     if (remainingFrames == 0) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            FlutterPcmSoundPlugin *instance = (__bridge FlutterPcmSoundPlugin *)(inRefCon);
             [instance stopAudioUnit];
+            instance.addingDummyDataTimes = 0;
         });
     }
 
@@ -349,6 +373,7 @@ static OSStatus RenderCallback(void *inRefCon,
         instance.mDidInvokeFeedCallback = true;
         NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
         dispatch_async(dispatch_get_main_queue(), ^{
+            FlutterPcmSoundPlugin *instance = (__bridge FlutterPcmSoundPlugin *)(inRefCon);
             [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
         });
     }
